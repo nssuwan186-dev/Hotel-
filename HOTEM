@@ -1,0 +1,1420 @@
+import telegram
+from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup, BotCommand
+from telegram.ext import (
+    Application, CommandHandler, MessageHandler, filters, ContextTypes, ConversationHandler, CallbackQueryHandler
+)
+import gspread
+from google.oauth2.service_account import Credentials
+import logging
+from datetime import datetime, timedelta
+import uuid
+import os
+
+# ----------------- ⚠️ การตั้งค่าที่ต้องแก้ไข ⚠️ -----------------
+# 1. โทเคนของ Telegram Bot (หาได้จาก BotFather)
+TELEGRAM_BOT_TOKEN = "7736033828:AAEY1ZwF2GvdlR5DaQfwgCiL_J12io-sAgI" # <<< โทเคนของบอท @Thanks_Verybot (How much)
+
+# 2. กุญแจผู้ดูแลระบบ (สำหรับ Admin Chat ID ของคุณ)
+# ✅ แก้ไขแล้ว: ใช้ Chat ID ที่คุณให้มา
+OWNER_CHAT_ID = 8144545476 # <<< นี่คือ Chat ID (ตัวเลข) ของบัญชี Telegram ของคุณ (@NS_suwan)
+# -----------------------------------------------------------
+
+# 3. ชื่อไฟล์ JSON Key ของ Google Service Account
+# ✅ แก้ไขแล้ว: ใช้ชื่อไฟล์ที่คุณให้มา "hotel-7321f-ed7ba9c7a35d.json"
+SERVICE_ACCOUNT_FILE = "hotel-7321f-ed7ba9c7a35d.json"
+# -----------------------------------------------------------
+
+# ตั้งค่า Logging (ยังคงเป็น DEBUG ชั่วคราวเพื่อดูรายละเอียดการทำงาน)
+logging.basicConfig(
+    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s', level=logging.DEBUG
+)
+logger = logging.getLogger(__name__)
+
+# สถานะของ ConversationHandler (ขยายสถานะสำหรับฟังก์ชันใหม่)
+MENU, CHECK_IN_ROOM, CHECK_IN_NAME, CHECK_IN_PHONE, CHECK_OUT_ROOM, \
+MONTHLY_MENU, EMPLOYEE_MENU, ADD_EMPLOYEE_NAME, ADD_EMPLOYEE_POSITION, \
+RENT_MENU, PRE_BOOKING_ROOM, PRE_BOOKING_DATE, PRE_BOOKING_NIGHTS, PRE_BOOKING_CONFIRM, \
+ADD_EMPLOYEE_SALARY, ADD_EMPLOYEE_BANK, ISSUE_INVOICE_ROOM, ISSUE_INVOICE_DETAILS, VIEW_EMPLOYEE, ADD_EMPLOYEE_DAILY_SALARY, \
+PRE_BOOKING_PHONE, PRE_BOOKING_PAYMENT_CONFIRM = range(22)
+
+# ขอบเขตของ Google Sheet
+SCOPES = [
+    'https://www.googleapis.com/auth/spreadsheets',
+    'https://www.googleapis.com/auth/drive'
+]
+
+# ชื่อไฟล์ Google Sheet ที่สร้างไว้แล้ว
+SPREADSHEET_NAME = "ระบบจัดการโรงแรม_DB"
+
+# Global Variables
+SHEET_DB = None
+ADMIN_CHAT_ID = None
+TELEGRAM_BOT_INSTANCE = None # สำหรับส่งข้อความแจ้งเตือนไปยัง Admin
+
+# --- GSPREAD SETUP ---
+def setup_gspread():
+    """ตั้งค่าการเชื่อมต่อ Google Sheets"""
+    global SHEET_DB
+    try:
+        if not os.path.exists(SERVICE_ACCOUNT_FILE):
+            raise FileNotFoundError(f"ไม่พบไฟล์ Service Account Key: '{SERVICE_ACCOUNT_FILE}'")
+
+        creds = Credentials.from_service_account_file(
+            SERVICE_ACCOUNT_FILE, scopes=SCOPES)
+        client = gspread.authorize(creds)
+        SHEET_DB = client.open(SPREADSHEET_NAME)
+        logger.info(f"✅ เชื่อมต่อ Google Sheet '{SPREADSHEET_NAME}' สำเร็จ")
+        return True
+    except FileNotFoundError as e:
+        logger.error(f"❌ เกิดข้อผิดพลาดในการเชื่อมต่อ Google Sheet: {e}")
+        logger.error(f"โปรดตรวจสอบว่าได้เปลี่ยน SERVICE_ACCOUNT_FILE เป็นชื่อไฟล์ JSON ที่ถูกต้องและไฟล์อยู่ในโฟลเดอร์เดียวกัน (โฟลเดอร์ปัจจุบัน: {os.getcwd()})")
+        return False
+    except gspread.exceptions.SpreadsheetNotFound:
+        logger.error(f"❌ ไม่พบ Google Sheet ชื่อ '{SPREADSHEET_NAME}' ตรวจสอบว่าชื่อถูกต้องและ Service Account มีสิทธิ์เข้าถึง")
+        return False
+    except gspread.exceptions.APIError as e:
+        logger.error(f"❌ เกิดข้อผิดพลาด Google Sheets API: {e}")
+        logger.error("ตรวจสอบการเชื่อมต่ออินเทอร์เน็ต, สิทธิ์ของ Service Account (Viewer/Editor) และเปิดใช้งาน Google Sheets API ใน Google Cloud Console.")
+        return False
+    except Exception as e:
+        logger.error(f"❌ เกิดข้อผิดพลาดในการเชื่อมต่อ Google Sheet (อื่นๆ): {e}")
+        logger.error("โปรดตรวจสอบการตั้งค่า Service Account, การเข้าถึง Google Sheet และว่าชื่อไฟล์ JSON ถูกต้อง.")
+        return False
+
+# --- UTILITIES ---
+
+async def notify_admin(message: str):
+    """ส่งข้อความแจ้งเตือนสำคัญไปยัง Admin"""
+    if ADMIN_CHAT_ID and TELEGRAM_BOT_INSTANCE:
+        try:
+            await TELEGRAM_BOT_INSTANCE.send_message(chat_id=ADMIN_CHAT_ID, text=f"🚨 **แจ้งเตือนผู้ดูแลระบบ** 🚨\n{message}", parse_mode='Markdown')
+            logger.info(f"แจ้งเตือน Admin แล้ว: {message}")
+        except Exception as e:
+            logger.error(f"ไม่สามารถส่งข้อความแจ้งเตือน Admin ได้ (Chat ID: {ADMIN_CHAT_ID}): {e}")
+    else:
+        logger.warning(f"ไม่สามารถแจ้งเตือน Admin ได้ (Admin Chat ID หรือ Bot Instance ไม่พร้อม): {message}")
+
+def get_worksheet(sheet_name):
+    """ดึง Worksheet ตามชื่อ"""
+    global SHEET_DB
+    if not SHEET_DB:
+        logger.warning(f"SHEET_DB ยังไม่ได้เชื่อมต่อ ลองตั้งค่าใหม่...")
+        if not setup_gspread():
+            logger.error("ไม่สามารถเชื่อมต่อ Google Sheets ได้หลังจากพยายามตั้งค่าใหม่")
+            return None
+    if not SHEET_DB:
+        logger.error(f"SHEET_DB ยังคงเป็น None หลังพยายามตั้งค่า. ไม่สามารถดึง Worksheet '{sheet_name}' ได้")
+        return None
+        
+    try:
+        ws = SHEET_DB.worksheet(sheet_name)
+        return ws
+    except gspread.WorksheetNotFound:
+        logger.error(f"ไม่พบ Worksheet ชื่อ '{sheet_name}' ใน Google Sheet '{SPREADSHEET_NAME}'")
+        return None
+    except Exception as e:
+        logger.error(f"เกิดข้อผิดพลาดในการดึง Worksheet '{sheet_name}': {e}")
+        return None
+
+def get_room_data(room_number=None):
+    """ดึงข้อมูลห้องพักทั้งหมด หรือเฉพาะห้องที่ระบุจาก 'ข้อมูลห้องพัก'"""
+    sheet = get_worksheet("ข้อมูลห้องพัก")
+    if not sheet:
+        return []
+    
+    try:
+        data = sheet.get_all_records()
+    except Exception as e:
+        logger.error(f"เกิดข้อผิดพลาดในการดึงข้อมูลจากชีต 'ข้อมูลห้องพัก': {e}")
+        return []
+
+    if room_number:
+        for room in data:
+            if room.get('หมายเลขห้อง') and str(room['หมายเลขห้อง']).upper() == room_number.upper():
+                return room
+        return None 
+    
+    return data
+
+def update_room_status(room_number, new_status):
+    """อัพเดทสถานะห้องพักในชีต 'ข้อมูลห้องพัก'"""
+    sheet = get_worksheet("ข้อมูลห้องพัก")
+    if not sheet: return False
+
+    try:
+        cell = sheet.find(room_number, in_column=1)
+        if not cell:
+            logger.warning(f"ไม่พบห้อง {room_number} ในชีต 'ข้อมูลห้องพัก' สำหรับการอัพเดทสถานะ")
+            return False
+            
+        headers = sheet.row_values(1)
+        try:
+            status_col_index = headers.index('สถานะ') + 1
+        except ValueError:
+            logger.error(f"ไม่พบหัวข้อ 'สถานะ' ในชีต 'ข้อมูลห้องพัก'")
+            return False
+        
+        sheet.update_cell(cell.row, status_col_index, new_status)
+        logger.info(f"อัพเดทสถานะห้อง {room_number} เป็น {new_status} สำเร็จ")
+        return True
+    except Exception as e:
+        logger.error(f"ไม่สามารถอัพเดทสถานะห้องพัก {room_number}: {e}")
+        return False
+
+def add_employee_record(data):
+    """บันทึกข้อมูลพนักงานใหม่ลงในชีต 'ข้อมูลพนักงาน'"""
+    sheet = get_worksheet("ข้อมูลพนักงาน")
+    if not sheet: return False
+    
+    try:
+        headers = sheet.row_values(1)
+        if not headers or len(headers) < 2:
+            logger.error("ชีต 'ข้อมูลพนักงาน' ไม่มีหัวข้อคอลัมน์ที่ถูกต้อง")
+            return False
+        
+        last_row_index = len(sheet.get_all_values())
+        data['emp_id'] = f"EMP{last_row_index}" 
+        data['วันที่สร้าง'] = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        
+        row_data = [data.get(h, '-') for h in headers]
+        
+        sheet.append_row(row_data)
+        logger.info(f"บันทึกข้อมูลพนักงาน {data.get('ชื่อ-สกุล')} สำเร็จ (ID: {data['emp_id']})")
+        return data['emp_id']
+    except Exception as e:
+        logger.error(f"ไม่สามารถบันทึกข้อมูลพนักงาน: {e}")
+        return False
+
+def add_stay_record(data, is_pre_booking=False):
+    """บันทึกข้อมูลการเข้าพัก/จองล่วงหน้าลงในชีต 'การเข้าพัก'"""
+    sheet = get_worksheet("การเข้าพัก")
+    if not sheet: return False
+
+    try:
+        headers = sheet.row_values(1)
+        if not headers or len(headers) < 5:
+            logger.error("ชีต 'การเข้าพัก' ไม่มีหัวข้อคอลัมน์ที่ถูกต้อง")
+            return False
+
+        data['booking_id'] = f"{'PRE' if is_pre_booking else 'STAY'}{uuid.uuid4().hex[:6].upper()}"
+        data['guest_id'] = data.get('guest_id', f"GUEST_{uuid.uuid4().hex[:4].upper()}")
+        data['วันที่สร้าง'] = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+
+        default_data = {
+            "เช็คอิน": data.get("วันที่เข้าพัก", datetime.now().strftime("%Y-%m-%d 14:00:00")),
+            "เช็คเอาท์": data.get("วันที่ออก", '-'),
+            "จำนวนคืน": data.get("จำนวนคืน", 1),
+            "ราคาต่อคืน": data.get("ราคาต่อคืน", 400),
+            "ยอดรวม": data.get("ยอดรวม", data.get("ราคาต่อคืน", 400)),
+            "วิธีชำระเงิน": data.get("วิธีชำระเงิน", 'เงินสด'),
+            "จำนวนผู้เข้าพัก": data.get("จำนวนผู้เข้าพัก", 1),
+            "สถานะ": data.get("สถานะ", 'ไม่ว่าง' if not is_pre_booking else 'จองล่วงหน้า'),
+            "สลิปมัดจำ(ลิงก์)": data.get("สลิปมัดจำ(ลิงก์)", '-'),
+        }
+        
+        final_data = {**default_data, **data}
+        row_data = [final_data.get(h, '-') for h in headers]
+        
+        sheet.append_row(row_data)
+        logger.info(f"บันทึกการเข้าพัก/จองล่วงหน้า '{final_data['booking_id']}' สำเร็จ")
+        return final_data['booking_id']
+    except Exception as e:
+        logger.error(f"ไม่สามารถบันทึกข้อมูลการเข้าพัก/จองล่วงหน้า: {e}")
+        return False
+
+def generate_qr_code_link(amount):
+    """จำลองการสร้างลิงก์ QR Code"""
+    return f"https://placehold.co/200x200/50C47D/ffffff?text=PAY:{amount}THB"
+
+def update_pre_booking_status(booking_id, new_status, deposit_slip_link='-'):
+    sheet = get_worksheet("การเข้าพัก")
+    if not sheet: return False
+
+    try:
+        cell = sheet.find(str(booking_id), in_column=1)
+        if not cell:
+            logger.warning(f"ไม่พบ Booking ID {booking_id} ในชีต 'การเข้าพัก' สำหรับการอัพเดทสถานะ")
+            return False
+        
+        headers = sheet.row_values(1)
+        try:
+            status_col_index = headers.index('สถานะ') + 1
+            slip_col_index = headers.index('สลิปมัดจำ(ลิงก์)') + 1
+        except ValueError as ve:
+            logger.error(f"ไม่พบหัวข้อคอลัมน์ที่จำเป็นในชีต 'การเข้าพัก': {ve}")
+            return False
+
+        sheet.update_cell(cell.row, status_col_index, new_status)
+        if deposit_slip_link != '-':
+            sheet.update_cell(cell.row, slip_col_index, deposit_slip_link)
+        logger.info(f"อัพเดทสถานะการจอง '{booking_id}' เป็น '{new_status}' สำเร็จ")
+        return True
+    except Exception as e:
+        logger.error(f"ไม่สามารถอัพเดทสถานะการจอง {booking_id}: {e}")
+        return False
+
+def check_room_availability_for_dates(room_number: str, check_in_date: datetime, check_out_date: datetime):
+    """
+    ตรวจสอบว่าห้องว่างในช่วงวันที่ที่ระบุหรือไม่ โดยตรวจสอบจากการจองที่มีอยู่ในชีต 'การเข้าพัก'
+    :param room_number: หมายเลขห้อง
+    :param check_in_date: วันที่เข้าพัก (datetime object)
+    :param check_out_date: วันที่เช็คเอาท์ (datetime object)
+    :return: True ถ้าห้องว่างในช่วงวันที่นั้น, False ถ้ามีช่วงเวลาทับซ้อน
+    """
+    sheet = get_worksheet("การเข้าพัก")
+    if not sheet:
+        logger.error(f"ไม่สามารถตรวจสอบห้องว่างได้: ไม่พบชีต 'การเข้าพัก'")
+        return False
+
+    try:
+        records = sheet.get_all_records()
+        
+        relevant_bookings = [
+            r for r in records 
+            if r.get('ห้อง') == room_number and 
+               r.get('สถานะ') in ['ไม่ว่าง', 'จองล่วงหน้า', 'ชำระมัดจำแล้ว (ด้วยมือ)', 'ชำระมัดจำแล้ว (มีสลิป)']
+        ]
+
+        for booking in relevant_bookings:
+            try:
+                existing_check_in_str = booking.get('เช็คอิน', '').split(' ')[0]
+                existing_check_out_str = booking.get('เช็คเอาท์', '').split(' ')[0]
+
+                existing_check_in_dt = datetime.strptime(existing_check_in_str, "%Y-%m-%d")
+                existing_check_out_dt = datetime.strptime(existing_check_out_str, "%Y-%m-%d")
+                
+                if (check_in_date < existing_check_out_dt) and \
+                   (check_out_date > existing_check_in_dt):
+                    logger.warning(f"ห้อง {room_number} มีการจองทับซ้อน: Booking ID {booking.get('booking_id')}, ช่วง {existing_check_in_str} ถึง {existing_check_out_str}")
+                    return False
+            except (ValueError, TypeError) as e:
+                logger.error(f"ข้อผิดพลาดในการแปลงวันที่ของการจอง ID {booking.get('booking_id')}: {e}")
+                continue
+
+    except Exception as e:
+        logger.error(f"เกิดข้อผิดพลาดในการดึงข้อมูลการจองจากชีต 'การเข้าพัก': {e}")
+        return False
+
+    return True
+
+# --- COMMAND HANDLERS ---
+
+async def debug_admin_auth_catch_all(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    """ฟังก์ชัน Debug สำหรับ MessageHandler catch-all ใน ADMIN_AUTH (ยังคงเก็บไว้เป็น fallback)"""
+    logger.debug(f"DEBUG: --- admin_auth_catch_all triggered! Received text: '{update.message.text}' (len: {len(update.message.text)}) from user {update.effective_user.id}")
+    await update.message.reply_text("Debug: บอทอยู่ในโหมด Admin Key. (สถานะนี้ควรถูกข้ามถ้าคุณเป็นเจ้าของ) กรุณาลอง /start เพื่อรีเซ็ต.")
+    return MENU # กลับไป MENU เผื่อหลุดมา
+
+async def unhandled_message_fallback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    """จับข้อความที่ไม่ถูกจัดการโดย ConversationHandler"""
+    logger.warning(f"DEBUG: Unhandled message caught by general fallback from {update.effective_user.id}: '{update.message.text}'")
+    await update.message.reply_text("🧐 ไม่เข้าใจคำสั่ง กรุณาเลือกจากเมนู หรือลอง /start หรือ /admin")
+    return ConversationHandler.END
+
+
+async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    """ตอบกลับด้วยข้อความต้อนรับและเมนูหลักสำหรับผู้ใช้งานทั่วไป"""
+    logger.debug(f"DEBUG: start command received from user {update.effective_user.id}")
+    # ตรวจสอบว่าผู้ใช้ปัจจุบันคือ Admin หรือไม่
+    if update.effective_chat.id == OWNER_CHAT_ID:
+        context.user_data['is_admin'] = True
+        global ADMIN_CHAT_ID, TELEGRAM_BOT_INSTANCE
+        ADMIN_CHAT_ID = update.effective_chat.id 
+        TELEGRAM_BOT_INSTANCE = context.bot
+        logger.info(f"Owner {update.effective_user.username} (ID: {update.effective_user.id}) recognized and set as Admin.")
+        return await send_admin_menu(update, context) # ถ้าเป็น Admin ให้ส่งเมนู Admin ไปเลย
+
+    # ถ้าไม่ใช่ Admin ให้แสดงเมนูเริ่มต้น
+    await update.message.reply_text(
+        "ยินดีต้อนรับสู่ระบบผู้ช่วยโรงแรมอัตโนมัติ!\n"
+        "กรุณาใช้คำสั่ง /admin เพื่อเข้าสู่ระบบจัดการห้องพัก",
+        reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("เข้าสู่ระบบผู้ดูแล", callback_data='admin')]])
+    )
+    return MENU
+
+
+async def admin(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    """ตรวจสอบสิทธิ์ Admin โดย Chat ID และแสดงเมนู Admin"""
+    user_id = update.effective_chat.id
+    username = update.effective_user.username if update.effective_user.username else f"User {user_id}"
+    logger.debug(f"DEBUG: admin command received from user {user_id}. Owner_ID: {OWNER_CHAT_ID}")
+
+    if user_id == OWNER_CHAT_ID:
+        context.user_data['is_admin'] = True
+        global ADMIN_CHAT_ID, TELEGRAM_BOT_INSTANCE
+        ADMIN_CHAT_ID = user_id
+        TELEGRAM_BOT_INSTANCE = context.bot
+        
+        message = "✅ เข้าสู่โหมดผู้ดูแลสำเร็จ! ดำเนินการต่อได้เลยครับ"
+        
+        if update.callback_query:
+            await update.callback_query.answer()
+            await update.callback_query.edit_message_text(message, parse_mode='Markdown')
+        else:
+            await update.message.reply_text(message, parse_mode='Markdown')
+        
+        await notify_admin(f"ผู้ใช้ `{username}` (ID: `{user_id}`) ได้เข้าสู่ระบบ Admin แล้ว.")
+        logger.info(f"Admin login successful for owner {username} (ID: {user_id})")
+        return await send_admin_menu(update, context) # ส่งเมนู Admin โดยตรง
+    else:
+        await update.effective_message.reply_text("🚫 คุณไม่มีสิทธิ์เข้าถึงโหมดผู้ดูแลระบบ")
+        logger.warning(f"Unauthorized admin access attempt from user {username} (ID: {user_id})")
+        return ConversationHandler.END # หรือจะกลับไป MENU ก็ได้
+
+
+async def send_admin_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """ส่งเมนูหลักสำหรับผู้ดูแลระบบ"""
+    logger.debug(f"DEBUG: send_admin_menu called for user {update.effective_user.id}")
+    keyboard = [
+        [InlineKeyboardButton("🏨 ตรวจสอบสถานะห้องว่าง", callback_data='check_status')],
+        [InlineKeyboardButton("🔑 เช็คอิน (รายวัน)", callback_data='check_in_start')],
+        [InlineKeyboardButton("🚪 เช็คเอาท์ (รายวัน)", callback_data='check_out_start')],
+        [InlineKeyboardButton("📅 จัดการการจองล่วงหน้า", callback_data='pre_booking_start')], 
+        [InlineKeyboardButton("🏠 จัดการผู้เช่ารายเดือน/พนักงาน", callback_data='monthly_system_start')], 
+        [InlineKeyboardButton("📊 ดูรายงาน/บัญชี", callback_data='view_reports')],
+        [InlineKeyboardButton("🛑 ออกจากระบบผู้ดูแล", callback_data='logout')],
+    ]
+    reply_markup = InlineKeyboardMarkup(keyboard)
+    
+    message = "🛠️ **เมนูผู้ดูแลระบบ** 🛠️\n"
+    message += "กรุณาเลือกดำเนินการด้านล่างนี้:"
+    
+    if update.callback_query:
+         await update.callback_query.edit_message_text(message, reply_markup=reply_markup, parse_mode='Markdown')
+    else:
+         await update.message.reply_text(message, reply_markup=reply_markup, parse_mode='Markdown')
+    
+    return MENU
+
+async def logout(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    """ออกจากระบบผู้ดูแล"""
+    logger.debug(f"DEBUG: logout command received from user {update.effective_user.id}")
+    query = update.callback_query
+    await query.answer()
+    context.user_data['is_admin'] = False
+    global ADMIN_CHAT_ID
+    ADMIN_CHAT_ID = None
+    TELEGRAM_BOT_INSTANCE = None
+    await query.edit_message_text("👋 ออกจากโหมดผู้ดูแลระบบแล้ว พิมพ์ /start เพื่อเริ่มใหม่")
+    return ConversationHandler.END
+
+
+# --- MENU CHOICE HANDLER (รวมการจัดการปุ่มทั้งหมด) ---
+
+async def handle_menu_choice(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    """จัดการเมื่อผู้ดูแลกดปุ่มเมนูหลัก/ย่อย"""
+    logger.debug(f"DEBUG: handle_menu_choice called with data: {update.callback_query.data if update.callback_query else 'No Callback'} for user {update.effective_user.id}")
+    query = update.callback_query
+    await query.answer()
+    data = query.data
+    
+    # ตรวจสอบสิทธิ์ Admin ทุกครั้งที่มีการกดปุ่ม (ยกเว้นปุ่ม 'admin' เอง)
+    if data not in ['admin'] and (not context.user_data.get('is_admin', False) or update.effective_chat.id != OWNER_CHAT_ID):
+        await query.edit_message_text("🚫 คุณไม่มีสิทธิ์เข้าถึงฟังก์ชันนี้ กรุณาเข้าสู่ระบบ Admin ด้วย /admin ก่อน")
+        return ConversationHandler.END
+    
+    if data == 'admin':
+        return await admin(update, context)
+
+    if data == 'check_status':
+        return await check_room_status(update, context) 
+    if data == 'check_in_start':
+        return await start_check_in(update, context)
+    if data == 'check_out_start':
+        return await start_check_out(update, context)
+    if data == 'pre_booking_start':
+        return await send_pre_booking_menu(update, context) 
+    if data == 'monthly_system_start':
+        return await send_monthly_menu(update, context) 
+    if data == 'view_reports':
+        await query.edit_message_text("📊 รายงานและบัญชี:\nกรุณาเข้าดูข้อมูลสรุปใน Google Sheet โดยตรง เพื่อความแม่นยำสูงสุด")
+        return await send_admin_menu(update, context)
+    if data == 'logout':
+        return await logout(update, context)
+    if data == 'back_to_menu':
+        return await send_admin_menu(update, context)
+
+    if data == 'payment_confirmed':
+        await query.edit_message_text("✅ บันทึกสถานะการชำระเงินเรียบร้อยแล้ว")
+        return await send_admin_menu(update, context)
+
+    if data == 'pre_booking_back':
+        return await send_admin_menu(update, context)
+    if data == 'add_pre_booking':
+        return await start_add_pre_booking(update, context)
+    if data == 'view_pre_booking_list':
+        return await view_pre_booking_list(update, context)
+    if data == 'save_pre_booking':
+        return await save_pre_booking_action(update, context)
+    if data.startswith('deposit_confirmed_photo:'):
+        booking_id = data.split(':')[1]
+        context.user_data['booking_id_for_slip'] = booking_id
+        await query.edit_message_text("กรุณาส่งรูปภาพสลิปการโอนเงินตอนนี้:")
+        return PRE_BOOKING_PAYMENT_CONFIRM
+    if data.startswith('deposit_confirmed_manual:'):
+        return await confirm_deposit_manual_action(update, context)
+    if data == 'cancel_pre_booking':
+        context.user_data.pop('pre_booking_data', None)
+        await query.edit_message_text("❌ ยกเลิกการจองล่วงหน้าแล้ว")
+        return await send_pre_booking_menu(update, context)
+    
+    if data == 'monthly_menu_back':
+        return await send_admin_menu(update, context)
+    if data == 'employee_menu_start':
+        return await send_employee_menu(update, context)
+    if data == 'rent_menu_start':
+        return await send_rent_menu(update, context)
+    
+    if data == 'employee_menu_back':
+        return await send_monthly_menu(update, context)
+    if data == 'add_employee_start':
+        return await start_add_employee(update, context)
+    if data == 'view_employee_list':
+        return await view_employee_list(update, context)
+    if data == 'final_add_employee':
+        return await final_add_employee_action(update, context)
+    if data == 'cancel_add_employee':
+        context.user_data.pop('new_employee', None)
+        await query.edit_message_text("❌ ยกเลิกการเพิ่มพนักงานแล้ว")
+        return await send_employee_menu(update, context)
+
+    if data == 'rent_menu_back':
+        return await send_monthly_menu(update, context)
+    if data == 'issue_invoice_start':
+        return await start_issue_invoice(update, context)
+    if data == 'manual_meter_entry':
+        return await manual_meter_entry(update, context)
+    if data == 'final_issue_invoice':
+        return await final_issue_invoice_action(update, context)
+    if data == 'final_invoice_paid':
+        await query.edit_message_text(f"✅ บันทึกสถานะห้อง **{context.user_data.get('invoice_data', {}).get('ห้อง', '')}** ชำระค่าเช่าเรียบร้อยแล้ว")
+        context.user_data.pop('invoice_data', None)
+        return await send_rent_menu(update, context)
+        
+    await query.edit_message_text("🧐 ไม่เข้าใจคำสั่ง กรุณาเลือกจากเมนู", reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🔙 กลับสู่เมนูหลัก", callback_data='back_to_menu')]]))
+    return MENU
+
+
+# --- ROOM STATUS ---
+async def check_room_status(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    """แสดงสถานะห้องพักว่าง/ไม่ว่างทั้งหมด"""
+    logger.debug(f"DEBUG: check_room_status called for user {update.effective_user.id}")
+    query = update.callback_query
+    await query.answer()
+    
+    room_data = get_room_data()
+    
+    if not room_data:
+        await query.edit_message_text("❌ ไม่พบข้อมูลห้องพักในระบบ หรือการเชื่อมต่อ Google Sheets มีปัญหา")
+        await notify_admin("พบปัญหา: ไม่สามารถดึงข้อมูลห้องพักได้")
+        return await send_admin_menu(update, context)
+
+    status_map = {}
+    for room in room_data:
+        status = room.get('สถานะ', 'ไม่ทราบสถานะ')
+        room_num = room.get('หมายเลขห้อง', '??')
+        if status not in status_map:
+            status_map[status] = []
+        status_map[status].append(room_num)
+
+    message = "🏨 **สถานะห้องพักปัจจุบัน** 🏨\n"
+    
+    vacant_rooms = sorted(status_map.pop('ว่าง', []))
+    message += f"🟢 **ห้องว่าง ({len(vacant_rooms)} ห้อง):**\n"
+    message += ", ".join(vacant_rooms) if vacant_rooms else "ไม่มี\n"
+    
+    occupied_rooms = sorted(status_map.pop('ไม่ว่าง', []))
+    message += f"\n🔴 **ห้องไม่ว่าง ({len(occupied_rooms)} ห้อง):**\n"
+    message += ", ".join(occupied_rooms) if occupied_rooms else "ไม่มี\n"
+    
+    for status, rooms in status_map.items():
+        rooms = sorted(rooms)
+        message += f"\n🟡 **{status} ({len(rooms)} ห้อง):**\n"
+        message += ", ".join(rooms)
+        
+    keyboard = [[InlineKeyboardButton("🔙 กลับสู่เมนูหลัก", callback_data='back_to_menu')]]
+    await query.edit_message_text(message, reply_markup=InlineKeyboardMarkup(keyboard), parse_mode='Markdown')
+    return MENU
+
+# --- DAILY CHECK-IN FLOW ---
+async def start_check_in(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    """เริ่มเช็คอิน: ขอหมายเลขห้อง"""
+    logger.debug(f"DEBUG: start_check_in called for user {update.effective_user.id}")
+    query = update.callback_query
+    await query.answer()
+    await query.edit_message_text("🔑 **เริ่มการเช็คอิน (รายวัน)**\n\n1. กรุณาพิมพ์ **หมายเลขห้อง** ที่ต้องการเช็คอิน:")
+    return CHECK_IN_ROOM
+
+async def get_check_in_room(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    """ตรวจสอบห้องว่างและขอชื่อแขก"""
+    logger.debug(f"DEBUG: get_check_in_room called with text: '{update.message.text}' from user {update.effective_user.id}")
+    room_number = update.message.text.strip().upper()
+    room_info = get_room_data(room_number)
+    
+    if not room_info:
+        await update.message.reply_text("❌ ไม่พบหมายเลขห้องนี้ในระบบ กรุณาใส่หมายเลขห้องอีกครั้ง:")
+        return CHECK_IN_ROOM
+    
+    if room_info.get('สถานะ') != 'ว่าง':
+        await update.message.reply_text(f"❌ ห้อง **{room_number}** สถานะเป็น **{room_info.get('สถานะ')}** ไม่สามารถเช็คอินได้ กรุณาใส่หมายเลขห้องว่าง:")
+        return CHECK_IN_ROOM
+    
+    context.user_data['check_in_data'] = {
+        'ห้อง': room_number, 
+        'ราคาต่อคืน': room_info.get('ราคาเริ่มต้น'),
+        'ประเภทเตียง': room_info.get('ประเภทเตียง')
+    }
+    
+    await update.message.reply_text(
+        f"✅ ห้อง **{room_number}** (฿{room_info.get('ราคาเริ่มต้น')}/คืน) ว่าง\n\n"
+        "2. กรุณาพิมพ์ **ชื่อ-นามสกุล** ผู้เข้าพัก:"
+    )
+    return CHECK_IN_NAME
+
+async def get_check_in_name(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    """บันทึกชื่อแขก: ขอเบอร์โทร"""
+    logger.debug(f"DEBUG: get_check_in_name called with text: '{update.message.text}' from user {update.effective_user.id}")
+    context.user_data['check_in_data']['ชื่อแขก'] = update.message.text
+    await update.message.reply_text("3. กรุณาพิมพ์ **เบอร์โทร** ผู้เข้าพัก:")
+    return CHECK_IN_PHONE
+
+async def final_check_in_action(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    """บันทึกเบอร์โทรและยืนยัน/บันทึกการเช็คอิน"""
+    logger.debug(f"DEBUG: final_check_in_action called with text: '{update.message.text}' from user {update.effective_user.id}")
+    context.user_data['check_in_data']['เบอร์โทร'] = update.message.text
+    
+    data = context.user_data.pop('check_in_data')
+    
+    room_price = float(data.get('ราคาต่อคืน', 0))
+    
+    data['จำนวนคืน'] = 1
+    data['ยอดรวม'] = room_price
+    data['สถานะ'] = 'ไม่ว่าง'
+    
+    booking_id = add_stay_record(data)
+    
+    if booking_id:
+        update_room_status(data['ห้อง'], 'ไม่ว่าง')
+        
+        qr_link = generate_qr_code_link(room_price)
+        
+        message = (
+            f"🎉 **เช็คอินสำเร็จ!** 🎉\n"
+            f"ห้อง: **{data['ห้อง']}** | ราคา: **฿{room_price:.2f}**\n"
+            f"ผู้เข้าพัก: {data['ชื่อแขก']}\n"
+            f"เบอร์โทร: {data['เบอร์โทร']}\n"
+            f"Booking ID: `{booking_id}`\n\n"
+            "💵 **กรุณาให้ลูกค้าชำระเงิน:**"
+        )
+        
+        keyboard = [
+            [InlineKeyboardButton(f"🔗 ลิงก์ QR Code (฿{room_price:.2f})", url=qr_link)],
+            [InlineKeyboardButton("✅ ยืนยันการชำระเงิน", callback_data='payment_confirmed')],
+            [InlineKeyboardButton("🔙 กลับสู่เมนูหลัก", callback_data='back_to_menu')]
+        ]
+        await update.message.reply_text(message, reply_markup=InlineKeyboardMarkup(keyboard), parse_mode='Markdown')
+    else:
+        await update.message.reply_text("❌ เช็คอินล้มเหลว! กรุณาตรวจสอบ Google Sheet (ดู Log สำหรับรายละเอียด)")
+        await notify_admin(f"❌ เช็คอินห้อง {data['ห้อง']} ล้มเหลว. ตรวจสอบ Log.")
+        return await send_admin_menu(update, context)
+
+    return MENU
+
+
+# --- DAILY CHECK-OUT FLOW ---
+async def start_check_out(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    """เริ่มเช็คเอาท์: ขอหมายเลขห้อง"""
+    logger.debug(f"DEBUG: start_check_out called for user {update.effective_user.id}")
+    query = update.callback_query
+    await query.answer()
+    await query.edit_message_text("🚪 **เริ่มการเช็คเอาท์**\n\n1. กรุณาพิมพ์ **หมายเลขห้อง** ที่ต้องการเช็คเอาท์:")
+    return CHECK_OUT_ROOM
+
+async def get_check_out_room(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    """ยืนยันการเช็คเอาท์และคำนวณยอดค้างจ่าย"""
+    logger.debug(f"DEBUG: get_check_out_room called with text: '{update.message.text}' from user {update.effective_user.id}")
+    room_number = update.message.text.strip().upper()
+    room_info = get_room_data(room_number)
+    
+    if not room_info or room_info.get('สถานะ') == 'ว่าง':
+        await update.message.reply_text(f"❌ ห้อง **{room_number}** ว่างอยู่ หรือไม่พบข้อมูล กรุณาใส่หมายเลขห้องที่กำลังเข้าพัก:")
+        return CHECK_OUT_ROOM
+    
+    sheet_stay = get_worksheet("การเข้าพัก")
+    if not sheet_stay:
+        await update.message.reply_text("❌ ไม่พบชีต 'การเข้าพัก' กรุณาตรวจสอบ Google Sheet.")
+        await notify_admin("❌ ไม่พบชีต 'การเข้าพัก' สำหรับการเช็คเอาท์")
+        return await send_admin_menu(update, context)
+
+    records = []
+    try:
+        records = sheet_stay.get_all_records()
+    except Exception as e:
+        logger.error(f"เกิดข้อผิดพลาดในการดึงข้อมูลจากชีต 'การเข้าพัก': {e}")
+        await update.message.reply_text("❌ เกิดข้อผิดพลาดในการดึงข้อมูลการเข้าพัก กรุณาลองใหม่")
+        return await send_admin_menu(update, context)
+
+    latest_stay = next((r for r in reversed(records) if r.get('ห้อง') == room_number and r.get('สถานะ') == 'ไม่ว่าง'), None)
+
+    if not latest_stay:
+        await update.message.reply_text(f"❌ ไม่พบข้อมูลการเข้าพักที่ใช้งานอยู่สำหรับห้อง **{room_number}**")
+        return await send_admin_menu(update, context)
+
+    outstanding_amount = 0
+    
+    try:
+        booking_id_cell = sheet_stay.find(str(latest_stay['booking_id']), in_column=1) 
+        if not booking_id_cell:
+            await update.message.reply_text("❌ ไม่พบ Booking ID สำหรับการเช็คเอาท์. กรุณาติดต่อผู้ดูแลระบบ.")
+            await notify_admin(f"❌ ไม่พบ Booking ID `{latest_stay['booking_id']}` ในชีต 'การเข้าพัก'")
+            return await send_admin_menu(update, context)
+
+        context.user_data['check_out_data'] = {
+            'booking_id': latest_stay['booking_id'],
+            'ห้อง': room_number,
+            'ชื่อแขก': latest_stay['ชื่อแขก'],
+            'ยอดค้างจ่าย': outstanding_amount,
+            'row_index': booking_id_cell.row 
+        }
+    except Exception as e:
+        logger.error(f"เกิดข้อผิดพลาดในการค้นหา Booking ID หรือเตรียมข้อมูลเช็คเอาท์: {e}")
+        await update.message.reply_text("❌ เกิดข้อผิดพลาดในการเตรียมข้อมูลเช็คเอาท์ กรุณาลองใหม่")
+        await notify_admin(f"❌ เกิดข้อผิดพลาดในการเตรียมข้อมูลเช็คเอาท์สำหรับห้อง {room_number}: {e}")
+        return await send_admin_menu(update, context)
+
+    message = (
+        f"🛎️ **ยืนยันการเช็คเอาท์** 🛎️\n"
+        f"ห้อง: **{room_number}**\n"
+        f"ผู้เข้าพัก: {latest_stay['ชื่อแขก']}\n"
+        f"Booking ID: `{latest_stay['booking_id']}`\n"
+        f"สถานะ: **{latest_stay['สถานะ']}**\n"
+        f"ยอดค้างจ่าย: ฿{outstanding_amount:.2f}\n\n"
+        "ดำเนินการเช็คเอาท์ห้องนี้ใช่หรือไม่?"
+    )
+
+    keyboard = [
+        [InlineKeyboardButton("✅ ยืนยันการเช็คเอาท์", callback_data='final_check_out')],
+        [InlineKeyboardButton("🔙 กลับสู่เมนูหลัก", callback_data='back_to_menu')]
+    ]
+    await update.message.reply_text(message, reply_markup=InlineKeyboardMarkup(keyboard), parse_mode='Markdown')
+    return MENU
+
+async def final_check_out_action(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    """ทำการเช็คเอาท์จริง"""
+    logger.debug(f"DEBUG: final_check_out_action called for user {update.effective_user.id}")
+    query = update.callback_query
+    await query.answer()
+
+    check_out_data = context.user_data.pop('check_out_data', None)
+    if not check_out_data:
+        await query.edit_message_text("❌ ข้อมูลการเช็คเอาท์ไม่ถูกต้อง กรุณาลองใหม่")
+        return await send_admin_menu(update, context)
+
+    room_number = check_out_data['ห้อง']
+    booking_id = check_out_data['booking_id']
+    stay_row_index = check_out_data['row_index']
+
+    if not update_room_status(room_number, 'ว่าง'):
+        await query.edit_message_text(f"❌ ไม่สามารถอัพเดทสถานะห้อง {room_number} ได้")
+        await notify_admin(f"❌ ไม่สามารถอัพเดทสถานะห้อง {room_number} เป็น 'ว่าง' ในชีต 'ข้อมูลห้องพัก' ได้")
+        return await send_admin_menu(update, context)
+
+    sheet_stay = get_worksheet("การเข้าพัก")
+    if sheet_stay:
+        try:
+            headers = sheet_stay.row_values(1)
+            status_col_index = headers.index('สถานะ') + 1
+            checkout_col_index = headers.index('เช็คเอาท์') + 1
+
+            sheet_stay.update_cell(stay_row_index, status_col_index, 'เช็คเอาท์แล้ว')
+            sheet_stay.update_cell(stay_row_index, checkout_col_index, datetime.now().strftime("%Y-%m-%d %H:%M:%S"))
+            logger.info(f"อัพเดทสถานะการเข้าพัก '{booking_id}' เป็น 'เช็คเอาท์แล้ว'")
+        except ValueError as ve:
+            logger.error(f"❌ ไม่พบหัวข้อคอลัมน์ที่จำเป็นในชีต 'การเข้าพัก': {ve}")
+            await notify_admin(f"❌ ไม่พบหัวข้อคอลัมน์ที่จำเป็นในชีต 'การเข้าพัก' (สถานะ/เช็คเอาท์) สำหรับ Booking ID '{booking_id}'")
+        except Exception as e:
+            logger.error(f"❌ ไม่สามารถอัพเดทข้อมูลการเข้าพักสำหรับ Booking ID '{booking_id}': {e}")
+            await notify_admin(f"❌ ไม่สามารถอัพเดทข้อมูลการเข้าพักสำหรับ Booking ID '{booking_id}': {e}")
+
+    await query.edit_message_text(f"✅ เช็คเอาท์ห้อง **{room_number}** สำเร็จแล้ว! ห้องกลับมาเป็นสถานะ 'ว่าง'")
+    return await send_admin_menu(update, context)
+
+# --- PRE-BOOKING FLOW ---
+async def send_pre_booking_menu(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    """แสดงเมนูจัดการการจองล่วงหน้า"""
+    logger.debug(f"DEBUG: send_pre_booking_menu called for user {update.effective_user.id}")
+    query = update.callback_query
+    await query.answer()
+    
+    keyboard = [
+        [InlineKeyboardButton("➕ เพิ่มการจองล่วงหน้าใหม่", callback_data='add_pre_booking')],
+        [InlineKeyboardButton("📝 ดูรายการจองล่วงหน้า", callback_data='view_pre_booking_list')],
+        [InlineKeyboardButton("🔙 กลับสู่เมนูหลัก", callback_data='back_to_menu')], # กลับไปเมนูหลัก Admin
+    ]
+    reply_markup = InlineKeyboardMarkup(keyboard)
+    await query.edit_message_text("📅 **เมนูจัดการการจองล่วงหน้า** 📅\nกรุณาเลือกดำเนินการ:", reply_markup=reply_markup, parse_mode='Markdown')
+    return MENU # <--- บรรทัดนี้แก้ไขแล้ว (ไม่ใช่ ConversationHandler.END)
+
+async def start_add_pre_booking(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    """เริ่มเพิ่มการจองล่วงหน้าใหม่: ขอหมายเลขห้อง"""
+    logger.debug(f"DEBUG: start_add_pre_booking called for user {update.effective_user.id}")
+    query = update.callback_query
+    await query.answer()
+    context.user_data['pre_booking_data'] = {}
+    await query.edit_message_text("➕ **เพิ่มการจองล่วงหน้า** ➕\n\n1. กรุณาพิมพ์ **หมายเลขห้อง** ที่ต้องการจองล่วงหน้า:")
+    return PRE_BOOKING_ROOM
+
+async def get_pre_booking_room(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    """รับหมายเลขห้อง, ตรวจสอบห้องว่าง และขอวันที่เข้าพัก"""
+    logger.debug(f"DEBUG: get_pre_booking_room called with text: '{update.message.text}' from user {update.effective_user.id}")
+    room_number = update.message.text.strip().upper()
+    room_info = get_room_data(room_number)
+    
+    if not room_info:
+        await update.message.reply_text("❌ ไม่พบหมายเลขห้องนี้ในระบบ กรุณาใส่หมายเลขห้องอีกครั้ง:")
+        return PRE_BOOKING_ROOM
+    
+    # ตรวจสอบว่าห้องยังว่าง "วันนี้" หรือไม่ (ถ้าไม่ว่างจริงๆ ก็แจ้งเตือนแต่ยังให้จองล่วงหน้าได้)
+    if room_info.get('สถานะ') == 'ไม่ว่าง':
+        await update.message.reply_text(f"⚠️ ห้อง **{room_number}** สถานะปัจจุบัน **ไม่ว่าง** แต่คุณสามารถดำเนินการจองล่วงหน้าสำหรับวันอื่นได้\n\n")
+    
+    context.user_data['pre_booking_data']['ห้อง'] = room_number
+    context.user_data['pre_booking_data']['ราคาต่อคืน'] = room_info.get('ราคาเริ่มต้น')
+
+    await update.message.reply_text("2. กรุณาพิมพ์ **วันที่ต้องการเข้าพัก** (รูปแบบ YYYY-MM-DD เช่น 2025-12-25):")
+    return PRE_BOOKING_DATE
+
+async def get_pre_booking_date(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    """รับวันที่เข้าพัก และขอจำนวนคืน"""
+    logger.debug(f"DEBUG: get_pre_booking_date called with text: '{update.message.text}' from user {update.effective_user.id}")
+    booking_date_str = update.message.text.strip()
+    try:
+        booking_date = datetime.strptime(booking_date_str, "%Y-%m-%d")
+        if booking_date < datetime.now().replace(hour=0, minute=0, second=0, microsecond=0):
+            await update.message.reply_text("❌ วันที่เข้าพักต้องเป็นวันปัจจุบันหรือในอนาคต กรุณาพิมพ์วันที่ใหม่อีกครั้ง (YYYY-MM-DD):")
+            return PRE_BOOKING_DATE
+        context.user_data['pre_booking_data']['วันที่เข้าพัก'] = booking_date_str
+    except ValueError:
+        await update.message.reply_text("❌ รูปแบบวันที่ไม่ถูกต้อง กรุณาใช้รูปแบบ YYYY-MM-DD (เช่น 2025-12-25):")
+        return PRE_BOOKING_DATE
+    
+    await update.message.reply_text("3. กรุณาพิมพ์ **จำนวนคืน** ที่เข้าพัก:")
+    return PRE_BOOKING_NIGHTS
+
+async def get_pre_booking_nights(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    """รับจำนวนคืน, ตรวจสอบการทับซ้อนของวันที่ และขอชื่อแขก"""
+    logger.debug(f"DEBUG: get_pre_booking_nights called with text: '{update.message.text}' from user {update.effective_user.id}")
+    try:
+        nights = int(update.message.text.strip())
+        if nights <= 0:
+            raise ValueError
+        context.user_data['pre_booking_data']['จำนวนคืน'] = nights
+        
+        check_in_date_str = context.user_data['pre_booking_data']['วันที่เข้าพัก']
+        check_in_date_dt = datetime.strptime(check_in_date_str, "%Y-%m-%d")
+        check_out_date_dt = check_in_date_dt + timedelta(days=nights)
+        context.user_data['pre_booking_data']['วันที่ออก'] = check_out_date_dt.strftime("%Y-%m-%d %H:%M:%S")
+
+        room_number = context.user_data['pre_booking_data']['ห้อง']
+
+        # ตรวจสอบช่วงวันว่างของห้องพัก
+        is_available = check_room_availability_for_dates(room_number, check_in_date_dt, check_out_date_dt)
+        if not is_available:
+            await update.message.reply_text(
+                f"❌ ห้อง **{room_number}** ไม่ว่างในช่วงวันที่ **{check_in_date_str}** ถึง **{check_out_date_dt.strftime('%Y-%m-%d')}** "
+                f"เนื่องจากมีการจองอื่นทับซ้อนอยู่ กรุณาเลือกห้องหรือวันที่อื่น:"
+            )
+            return PRE_BOOKING_ROOM # กลับไปขอหมายเลขห้องใหม่ (หรือจะกลับไปขอวันใหม่ก็ได้)
+
+        room_price_per_night = float(context.user_data['pre_booking_data'].get('ราคาต่อคืน', 0))
+        total_amount = room_price_per_night * nights
+        context.user_data['pre_booking_data']['ยอดรวม'] = total_amount
+        context.user_data['pre_booking_data']['สถานะ'] = 'จองล่วงหน้า'
+
+    except ValueError:
+        await update.message.reply_text("❌ จำนวนคืนไม่ถูกต้อง กรุณาใส่เป็นตัวเลขจำนวนเต็มบวก:")
+        return PRE_BOOKING_NIGHTS
+    
+    await update.message.reply_text("4. กรุณาพิมพ์ **ชื่อ-นามสกุล** ผู้จอง:")
+    return PRE_BOOKING_CONFIRM
+
+async def get_pre_booking_name(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    """รับชื่อผู้จอง และขอเบอร์โทร"""
+    logger.debug(f"DEBUG: get_pre_booking_name called with text: '{update.message.text}' from user {update.effective_user.id}")
+    context.user_data['pre_booking_data']['ชื่อแขก'] = update.message.text
+    await update.message.reply_text("5. กรุณาพิมพ์ **เบอร์โทร** ผู้จอง:")
+    return PRE_BOOKING_PHONE
+
+async def final_pre_booking_action(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    """บันทึกเบอร์โทรและยืนยัน/บันทึกการจองล่วงหน้า"""
+    logger.debug(f"DEBUG: final_pre_booking_action called with text: '{update.message.text}' from user {update.effective_user.id}")
+    context.user_data['pre_booking_data']['เบอร์โทร'] = update.message.text
+    
+    data = context.user_data.get('pre_booking_data')
+    if not data:
+        await update.effective_message.reply_text("❌ ข้อมูลการจองล่วงหน้าไม่ถูกต้อง กรุณาลองใหม่")
+        return await send_pre_booking_menu(update, context)
+
+    message = (
+        f"✅ **ข้อมูลการจองล่วงหน้า:**\n"
+        f"ห้อง: **{data['ห้อง']}** (฿{float(data.get('ราคาต่อคืน', 0)):.2f}/คืน)\n"
+        f"ผู้จอง: {data['ชื่อแขก']}\n"
+        f"เบอร์โทร: {data['เบอร์โทร']}\n"
+        f"วันที่เข้าพัก: {data['วันที่เข้าพัก']}\n"
+        f"จำนวนคืน: {data['จำนวนคืน']} คืน (เช็คเอาท์: {data['วันที่ออก'].split(' ')[0]})\n"
+        f"ยอดรวม: **฿{float(data['ยอดรวม']):.2f}**\n\n"
+        "ยืนยันการจองล่วงหน้านี้หรือไม่?"
+    )
+    
+    keyboard = [
+        [InlineKeyboardButton("✅ ยืนยันการจอง", callback_data='save_pre_booking')],
+        [InlineKeyboardButton("❌ ยกเลิก", callback_data='cancel_pre_booking')]
+    ]
+    
+    await update.message.reply_text(message, reply_markup=InlineKeyboardMarkup(keyboard), parse_mode='Markdown')
+    return PRE_BOOKING_PAYMENT_CONFIRM
+
+async def save_pre_booking_action(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    """บันทึกข้อมูลการจองล่วงหน้าลง Google Sheet และส่ง QR Code"""
+    logger.debug(f"DEBUG: save_pre_booking_action called for user {update.effective_user.id}")
+    query = update.callback_query
+    await query.answer()
+
+    data = context.user_data.pop('pre_booking_data', None)
+    if not data:
+        await query.edit_message_text("❌ ไม่พบข้อมูลการจองล่วงหน้าที่จะบันทึก กรุณาลองใหม่")
+        return await send_pre_booking_menu(update, context)
+    
+    booking_id = add_stay_record(data, is_pre_booking=True)
+    
+    if booking_id:
+        deposit_amount = float(data['ยอดรวม']) * 0.5
+        qr_link = generate_qr_code_link(deposit_amount)
+        
+        message = (
+            f"🎉 **บันทึกการจองล่วงหน้าสำเร็จ!** 🎉\n"
+            f"ห้อง: **{data['ห้อง']}** | ผู้จอง: {data['ชื่อแขก']}\n"
+            f"เบอร์โทร: {data['เบอร์โทร']}\n"
+            f"วันที่เข้าพัก: {data['วันที่เข้าพัก']} (จำนวน {data['จำนวนคืน']} คืน)\n"
+            f"ยอดรวม: **฿{float(data['ยอดรวม']):.2f}**\n"
+            f"ยอดมัดจำ: **฿{deposit_amount:.2f}**\n"
+            f"Booking ID: `{booking_id}`\n\n"
+            "💵 **กรุณาให้ลูกค้าชำระมัดจำ:**"
+        )
+        
+        keyboard = [
+            [InlineKeyboardButton(f"🔗 ลิงก์ QR Code (มัดจำ ฿{deposit_amount:.2f})", url=qr_link)],
+            [InlineKeyboardButton("📸 ยืนยันด้วยสลิปภาพถ่าย", callback_data=f'deposit_confirmed_photo:{booking_id}')],
+            [InlineKeyboardButton("✅ ยืนยันการชำระด้วยมือ", callback_data=f'deposit_confirmed_manual:{booking_id}')],
+            [InlineKeyboardButton("🔙 กลับสู่เมนูจองล่วงหน้า", callback_data='pre_booking_back')]
+        ]
+        
+        context.user_data['booking_id_for_slip'] = booking_id
+
+        await context.bot.send_photo(
+            chat_id=update.effective_chat.id,
+            photo=qr_link,
+            caption=message,
+            reply_markup=InlineKeyboardMarkup(keyboard),
+            parse_mode='Markdown'
+        )
+        await query.delete_message()
+    else:
+        await query.edit_message_text("❌ บันทึกการจองล่วงหน้าล้มเหลว! กรุณาตรวจสอบ Google Sheet (ดู Log สำหรับรายละเอียด)")
+        await notify_admin(f"❌ บันทึกการจองล่วงหน้าห้อง {data['ห้อง']} ล้มเหลว. ตรวจสอบ Log.")
+        return await send_pre_booking_menu(update, context)
+
+    return PRE_BOOKING_PAYMENT_CONFIRM
+
+async def confirm_deposit_manual_action(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    """ยืนยันการชำระมัดจำด้วยมือ"""
+    logger.debug(f"DEBUG: confirm_deposit_manual_action called for user {update.effective_user.id}")
+    query = update.callback_query
+    await query.answer()
+
+    booking_id = query.data.split(':')[1]
+
+    if update_pre_booking_status(booking_id, 'ชำระมัดจำแล้ว (ด้วยมือ)', '-'):
+        await query.edit_message_text(f"✅ บันทึกสถานะการจอง `{booking_id}` เป็น **'ชำระมัดจำแล้ว (ด้วยมือ)'** เรียบร้อย!")
+        await notify_admin(f"✅ การจอง `{booking_id}` ได้รับการยืนยันชำระมัดจำด้วยมือแล้ว.")
+    else:
+        await query.edit_message_text(f"❌ ไม่สามารถอัปเดตสถานะการจอง `{booking_id}` ได้ กรุณาตรวจสอบ Log.")
+        await notify_admin(f"❌ ไม่สามารถอัปเดตสถานะการจอง `{booking_id}` เป็น 'ชำระมัดจำแล้ว' ได้")
+    
+    return await send_pre_booking_menu(update, context)
+
+
+async def handle_deposit_photo(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    """รับรูปภาพสลิปการโอนเงินและบันทึกลง Google Drive (จำลอง)"""
+    logger.debug(f"DEBUG: handle_deposit_photo called from user {update.effective_user.id}")
+    
+    if not update.message.photo:
+        await update.message.reply_text("❌ กรุณาส่งเป็นรูปภาพสลิปเท่านั้น")
+        return PRE_BOOKING_PAYMENT_CONFIRM
+
+    photo_file_id = update.message.photo[-1].file_id
+    
+    mock_drive_link = f"https://drive.google.com/file/d/MOCK_SLIP_ID_{photo_file_id}/view" 
+    
+    booking_id = context.user_data.pop('booking_id_for_slip', None)
+    if not booking_id:
+        await update.message.reply_text("❌ ไม่พบข้อมูลการจองสำหรับสลิปนี้ กรุณาลองใหม่")
+        return await send_pre_booking_menu(update, context)
+
+    if update_pre_booking_status(booking_id, 'ชำระมัดจำแล้ว (มีสลิป)', mock_drive_link):
+        await update.message.reply_text(
+            f"✅ บันทึกสถานะการจอง `{booking_id}` เป็น **'ชำระมัดจำแล้ว (มีสลิป)'** เรียบร้อย!\n"
+            f"🔗 ลิงก์สลิป: {mock_drive_link}"
+        )
+        await notify_admin(f"✅ การจอง `{booking_id}` ได้รับการยืนยันชำระมัดจำพร้อมสลิปแล้ว.\nลิงก์สลิป: {mock_drive_link}")
+    else:
+        await update.message.reply_text(f"❌ ไม่สามารถอัปเดตสถานะการจอง `{booking_id}` ได้ กรุณาตรวจสอบ Log.")
+        await notify_admin(f"❌ ไม่สามารถอัปเดตสถานะการจอง `{booking_id}` เป็น 'ชำระมัดจำแล้ว' ได้ (พร้อมสลิป)")
+
+    return await send_pre_booking_menu(update, context)
+
+
+# --- Monthly System Menu ---
+async def send_monthly_menu(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    """แสดงเมนูสำหรับระบบรายเดือน"""
+    logger.debug(f"DEBUG: send_monthly_menu called for user {update.effective_user.id}")
+    query = update.callback_query
+    await query.answer()
+    
+    keyboard = [
+        [InlineKeyboardButton("👥 จัดการข้อมูลพนักงาน", callback_data='employee_menu_start')],
+        [InlineKeyboardButton("🏡 จัดการผู้เช่ารายเดือน", callback_data='rent_menu_start')],
+        [InlineKeyboardButton("🔙 กลับสู่เมนูหลัก", callback_data='monthly_menu_back')],
+    ]
+    reply_markup = InlineKeyboardMarkup(keyboard)
+    await query.edit_message_text("🏠 **ระบบจัดการผู้เช่ารายเดือน/พนักงาน** 🏠\nกรุณาเลือกดำเนินการ:", reply_markup=reply_markup, parse_mode='Markdown')
+    return MONTHLY_MENU
+
+# --- Employee Management Menu ---
+async def send_employee_menu(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    """แสดงเมนูจัดการพนักงาน"""
+    logger.debug(f"DEBUG: send_employee_menu called for user {update.effective_user.id}")
+    query = update.callback_query
+    await query.answer()
+    
+    keyboard = [
+        [InlineKeyboardButton("➕ เพิ่มพนักงานใหม่", callback_data='add_employee_start')],
+        [InlineKeyboardButton("📝 ดูรายชื่อพนักงาน", callback_data='view_employee_list')],
+        [InlineKeyboardButton("🔙 กลับ", callback_data='employee_menu_back')],
+    ]
+    reply_markup = InlineKeyboardMarkup(keyboard)
+    await query.edit_message_text("👥 **เมนูจัดการพนักงาน** 👥\nกรุณาเลือกดำเนินการ:", reply_markup=reply_markup, parse_mode='Markdown')
+    return EMPLOYEE_MENU
+
+async def start_add_employee(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    """เริ่มต้นเพิ่มพนักงานใหม่: ขอชื่อ"""
+    logger.debug(f"DEBUG: start_add_employee called for user {update.effective_user.id}")
+    query = update.callback_query
+    await query.answer()
+    context.user_data['new_employee'] = {}
+    await query.edit_message_text("➕ **เพิ่มพนักงานใหม่** ➕\n\n1. กรุณาพิมพ์ **ชื่อ-นามสกุล** พนักงาน:")
+    return ADD_EMPLOYEE_NAME
+
+async def get_employee_name(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    """บันทึกชื่อพนักงาน: ขอตำแหน่ง"""
+    logger.debug(f"DEBUG: get_employee_name called with text: '{update.message.text}' from user {update.effective_user.id}")
+    context.user_data['new_employee']['ชื่อ-สกุล'] = update.message.text
+    await update.message.reply_text("2. กรุณาพิมพ์ **ตำแหน่ง** ของพนักงาน (เช่น พนักงานทำความสะอาด, แม่บ้าน, รปภ.):")
+    return ADD_EMPLOYEE_POSITION
+
+async def get_employee_position(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    """บันทึกตำแหน่งพนักงาน: ขอค่าจ้างรายเดือน"""
+    logger.debug(f"DEBUG: get_employee_position called with text: '{update.message.text}' from user {update.effective_user.id}")
+    context.user_data['new_employee']['ตำแหน่ง'] = update.message.text
+    await update.message.reply_text("3. กรุณาพิมพ์ **ค่าจ้างรายเดือน** (ถ้ามี, หากไม่มีพิมพ์ 0):")
+    return ADD_EMPLOYEE_SALARY
+
+async def get_employee_salary(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    """บันทึกค่าจ้างรายเดือน: ขอค่าจ้างรายวัน"""
+    logger.debug(f"DEBUG: get_employee_salary called with text: '{update.message.text}' from user {update.effective_user.id}")
+    try:
+        salary = float(update.message.text.strip())
+        context.user_data['new_employee']['ค่าจ้างรายเดือน'] = salary
+    except ValueError:
+        await update.message.reply_text("❌ ค่าจ้างรายเดือนไม่ถูกต้อง กรุณาใส่ตัวเลข:")
+        return ADD_EMPLOYEE_SALARY
+    await update.message.reply_text("4. กรุณาพิมพ์ **ค่าจ้างรายวัน** (ถ้ามี, หากไม่มีพิมพ์ 0):")
+    return ADD_EMPLOYEE_DAILY_SALARY
+
+async def get_employee_daily_salary(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    """บันทึกค่าจ้างรายวัน: ขอเลขบัญชี"""
+    logger.debug(f"DEBUG: get_employee_daily_salary called with text: '{update.message.text}' from user {update.effective_user.id}")
+    try:
+        daily_salary = float(update.message.text.strip())
+        context.user_data['new_employee']['ค่าจ้างรายวัน'] = daily_salary
+    except ValueError:
+        await update.message.reply_text("❌ ค่าจ้างรายวันไม่ถูกต้อง กรุณาใส่ตัวเลข:")
+        return ADD_EMPLOYEE_DAILY_SALARY
+    
+    await update.message.reply_text("5. กรุณาพิมพ์ **เลขบัญชีธนาคาร** ของพนักงาน (ถ้ามี):")
+    return ADD_EMPLOYEE_BANK
+
+async def get_employee_bank(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    """บันทึกเลขบัญชีและขอชื่อธนาคาร"""
+    logger.debug(f"DEBUG: get_employee_bank called with text: '{update.message.text}' from user {update.effective_user.id}")
+    context.user_data['new_employee']['เลขบัญชี'] = update.message.text
+    
+    await update.message.reply_text("6. กรุณาพิมพ์ **ชื่อธนาคาร** (เช่น กสิกรไทย, ไทยพาณิชย์):")
+    return VIEW_EMPLOYEE
+
+async def confirm_add_employee(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    """บันทึกชื่อธนาคารและยืนยัน/บันทึกข้อมูลพนักงาน"""
+    logger.debug(f"DEBUG: confirm_add_employee called with text: '{update.message.text}' from user {update.effective_user.id}")
+    context.user_data['new_employee']['ธนาคาร'] = update.message.text
+
+    employee_data = context.user_data['new_employee']
+    
+    message = (
+        f"**ข้อมูลพนักงานที่ต้องการเพิ่ม:**\n"
+        f"ชื่อ-สกุล: {employee_data.get('ชื่อ-สกุล', '-')}\n"
+        f"ตำแหน่ง: {employee_data.get('ตำแหน่ง', '-')}\n"
+        f"ค่าจ้างรายเดือน: ฿{employee_data.get('ค่าจ้างรายเดือน', 0):.2f}\n"
+        f"ค่าจ้างรายวัน: ฿{employee_data.get('ค่าจ้างรายวัน', 0):.2f}\n"
+        f"เลขบัญชี: {employee_data.get('เลขบัญชี', '-')}\n"
+        f"ธนาคาร: {employee_data.get('ธนาคาร', '-')}\n\n"
+        "ยืนยันที่จะเพิ่มพนักงานคนนี้หรือไม่?"
+    )
+    
+    keyboard = [
+        [InlineKeyboardButton("✅ ยืนยัน", callback_data='final_add_employee')],
+        [InlineKeyboardButton("❌ ยกเลิก", callback_data='cancel_add_employee')]
+    ]
+    
+    await update.message.reply_text(message, reply_markup=InlineKeyboardMarkup(keyboard), parse_mode='Markdown')
+    return EMPLOYEE_MENU
+
+async def final_add_employee_action(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    """บันทึกข้อมูลพนักงานลง Google Sheet"""
+    logger.debug(f"DEBUG: final_add_employee_action called for user {update.effective_user.id}")
+    query = update.callback_query
+    await query.answer()
+
+    employee_data = context.user_data.pop('new_employee', None)
+    if not employee_data:
+        await query.edit_message_text("❌ ไม่พบข้อมูลพนักงานที่จะบันทึก กรุณาลองใหม่")
+        return await send_employee_menu(update, context)
+
+    emp_id = add_employee_record(employee_data)
+
+    if emp_id:
+        await query.edit_message_text(f"✅ เพิ่มพนักงาน **{employee_data['ชื่อ-สกุล']}** (ID: `{emp_id}`) สำเร็จแล้ว!")
+    else:
+        await query.edit_message_text("❌ เพิ่มพนักงานล้มเหลว! กรุณาตรวจสอบ Google Sheet (ดู Log สำหรับรายละเอียด)")
+        await notify_admin(f"❌ เพิ่มพนักงาน {employee_data.get('ชื่อ-สกุล', '')} ล้มเหลว. ตรวจสอบ Log.")
+
+    return await send_employee_menu(update, context)
+
+async def view_employee_list(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    """แสดงรายชื่อพนักงานทั้งหมด"""
+    logger.debug(f"DEBUG: view_employee_list called for user {update.effective_user.id}")
+    query = update.callback_query
+    await query.answer()
+    
+    sheet = get_worksheet("ข้อมูลพนักงาน")
+    if not sheet:
+        await query.edit_message_text("❌ ไม่พบชีต 'ข้อมูลพนักงาน' กรุณาตรวจสอบ Google Sheet.")
+        return await send_employee_menu(update, context)
+
+    employees = []
+    try:
+        employees = sheet.get_all_records()
+    except Exception as e:
+        logger.error(f"เกิดข้อผิดพลาดในการดึงข้อมูลพนักงาน: {e}")
+        await query.edit_message_text("❌ เกิดข้อผิดพลาดในการดึงข้อมูลพนักงาน กรุณาลองใหม่")
+        await notify_admin(f"❌ เกิดข้อผิดพลาดในการดึงข้อมูลพนักงานจากชีต 'ข้อมูลพนักงาน': {e}")
+        return await send_employee_menu(update, context)
+    
+    if not employees:
+        await query.edit_message_text("📝 ไม่มีข้อมูลพนักงานในระบบ")
+    else:
+        message_parts = ["📝 **รายชื่อพนักงาน:**\n\n"]
+        for emp in employees:
+            part = (
+                f"**ID:** `{emp.get('emp_id', '-')}`\n"
+                f"**ชื่อ:** {emp.get('ชื่อ-สกุล', '-')}\n"
+                f"**ตำแหน่ง:** {emp.get('ตำแหน่ง', '-')}\n"
+                f"**ค่าจ้างรายเดือน:** ฿{float(emp.get('ค่าจ้างรายเดือน', 0)):.2f}\n"
+                f"**ค่าจ้างรายวัน:** ฿{float(emp.get('ค่าจ้างรายวัน', 0)):.2f}\n"
+                f"**เลขบัญชี:** {emp.get('เลขบัญชี', '-')}\n"
+                f"**ธนาคาร:** {emp.get('ธนาคาร', '-')}\n"
+                f"---------------------------\n"
+            )
+            if len(message_parts[-1]) + len(part) > 4000:
+                message_parts.append(part)
+            else:
+                message_parts[-1] += part
+        
+        for i, part_msg in enumerate(message_parts):
+            if i == 0:
+                await query.edit_message_text(part_msg, parse_mode='Markdown')
+            else:
+                await query.message.reply_text(part_msg, parse_mode='Markdown')
+            
+    keyboard = [[InlineKeyboardButton("🔙 กลับ", callback_data='employee_menu_back')]]
+    await query.edit_message_reply_markup(reply_markup=InlineKeyboardMarkup(keyboard))
+    return EMPLOYEE_MENU
+
+# --- Rent Management Menu ---
+async def send_rent_menu(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    """แสดงเมนูสำหรับระบบรายเดือน"""
+    logger.debug(f"DEBUG: send_rent_menu called for user {update.effective_user.id}")
+    query = update.callback_query
+    await query.answer()
+    
+    keyboard = [
+        [InlineKeyboardButton("🧾 ออกใบแจ้งหนี้ค่าเช่า", callback_data='issue_invoice_start')],
+        [InlineKeyboardButton("⚡️ บันทึกมิเตอร์ไฟ/น้ำ (เอง)", callback_data='manual_meter_entry')],
+        [InlineKeyboardButton("🔙 กลับ", callback_data='rent_menu_back')],
+    ]
+    reply_markup = InlineKeyboardMarkup(keyboard)
+    await query.edit_message_text("🏡 **เมนูจัดการผู้เช่ารายเดือน** 🏡\nกรุณาเลือกดำเนินการ:", reply_markup=reply_markup, parse_mode='Markdown')
+    return RENT_MENU
+
+async def start_issue_invoice(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    """เริ่มออกใบแจ้งหนี้: ขอหมายเลขห้อง"""
+    logger.debug(f"DEBUG: start_issue_invoice called for user {update.effective_user.id}")
+    query = update.callback_query
+    await query.answer()
+    await query.edit_message_text("🧾 **ออกใบแจ้งหนี้ค่าเช่า** 🧾\n\n1. กรุณาพิมพ์ **หมายเลขห้อง** ผู้เช่าที่ต้องการออกใบแจ้งหนี้:")
+    return ISSUE_INVOICE_ROOM
+
+async def get_invoice_room(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    """บันทึกหมายเลขห้องและขอรายละเอียดค่าเช่า"""
+    logger.debug(f"DEBUG: get_invoice_room called with text: '{update.message.text}' from user {update.effective_user.id}")
+    room_number = update.message.text.strip().upper()
+    
+    room_info = get_room_data(room_number)
+    if not room_info:
+        await update.message.reply_text("❌ ไม่พบหมายเลขห้องนี้ในระบบ กรุณาตรวจสอบและพิมพ์หมายเลขห้องอีกครั้ง:")
+        return ISSUE_INVOICE_ROOM
+    
+    context.user_data['invoice_data'] = {'ห้อง': room_number}
+    
+    await update.message.reply_text(
+        f"สำหรับห้อง **{room_number}**\n"
+        "2. กรุณาพิมพ์ **รายละเอียดค่าใช้จ่าย** (เช่น ค่าห้อง 3000, ค่าไฟ 250, ค่าน้ำ 100):"
+    )
+    await update.message.reply_text("ตัวอย่าง: `ค่าห้อง 3000, ค่าไฟ 250, ค่าน้ำ 100, ค่าปรับ 50`")
+    return ISSUE_INVOICE_DETAILS
+
+async def get_invoice_details_and_confirm(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    """บันทึกรายละเอียดและยืนยันการออกใบแจ้งหนี้"""
+    logger.debug(f"DEBUG: get_invoice_details_and_confirm called with text: '{update.message.text}' from user {update.effective_user.id}")
+    details_text = update.message.text
+    context.user_data['invoice_data']['รายละเอียด'] = details_text
+    
+    total_amount = 0
+    parsed_details = []
+    
+    parts = details_text.split(',')
+    for part in parts:
+        try:
+            name, value = part.strip().rsplit(' ', 1)
+            value = float(value)
+            total_amount += value
+            parsed_details.append(f"{name.strip()}: ฿{value:.2f}")
+        except ValueError:
+            parsed_details.append(f"{part.strip()} (ไม่สามารถคำนวณได้)")
+
+    context.user_data['invoice_data']['ยอดรวม'] = total_amount
+    
+    message = (
+        f"🧾 **ข้อมูลใบแจ้งหนี้สำหรับห้อง {context.user_data['invoice_data']['ห้อง']}** 🧾\n"
+        f"**รายละเอียด:**\n"
+        + "\n".join(parsed_details) + "\n\n"
+        f"**ยอดรวมทั้งหมด: ฿{total_amount:.2f}**\n\n"
+        "ยืนยันที่จะออกใบแจ้งหนี้นี้หรือไม่?"
+    )
+    
+    keyboard = [
+        [InlineKeyboardButton("✅ ออกใบแจ้งหนี้และบันทึก", callback_data='final_issue_invoice')],
+        [InlineKeyboardButton("❌ ยกเลิก", callback_data='rent_menu_back')]
+    ]
+    
+    await update.message.reply_text(message, reply_markup=InlineKeyboardMarkup(keyboard), parse_mode='Markdown')
+    return RENT_MENU
+
+async def final_issue_invoice_action(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    """บันทึกใบแจ้งหนี้ลง Google Sheet และส่ง QR Code"""
+    logger.debug(f"DEBUG: final_issue_invoice_action called for user {update.effective_user.id}")
+    query = update.callback_query
+    await query.answer()
+
+    invoice_data = context.user_data.pop('invoice_data', None)
+    if not invoice_data:
+        await query.edit_message_text("❌ ไม่พบข้อมูลใบแจ้งหนี้ที่จะบันทึก กรุณาลองใหม่")
+        return await send_rent_menu(update, context)
+
+    logger.info(f"จำลองการบันทึกใบแจ้งหนี้: ห้อง {invoice_data['ห้อง']}, ยอดรวม {invoice_data['ยอดรวม']}")
+    
+    qr_link = generate_qr_code_link(invoice_data['ยอดรวม'])
+
+    message = (
+        f"✅ ออกใบแจ้งหนี้สำหรับห้อง **{invoice_data['ห้อง']}** สำเร็จ!\n"
+        f"ยอดรวม: **฿{invoice_data['ยอดรวม']:.2f}**\n\n"
+        "💵 **กรุณาส่ง QR Code ให้ลูกค้าชำระเงิน:**"
+    )
+
+    keyboard = [
+        [InlineKeyboardButton(f"🔗 ลิงก์ QR Code (฿{invoice_data['ยอดรวม']:.2f})", url=qr_link)],
+        [InlineKeyboardButton("✅ ลูกค้าชำระแล้ว", callback_data='final_invoice_paid')],
+        [InlineKeyboardButton("🔙 กลับสู่เมนูจัดการค่าเช่า", callback_data='rent_menu_back')]
+    ]
+    
+    await query.edit_message_text(message, reply_markup=InlineKeyboardMarkup(keyboard), parse_mode='Markdown')
+    return RENT_MENU
+
+async def manual_meter_entry(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    """เริ่มบันทึกมิเตอร์ไฟ/น้ำด้วยตนเอง (ฟังก์ชันนี้เป็นเพียงโครงสร้างเบื้องต้น)"""
+    logger.debug(f"DEBUG: manual_meter_entry called for user {update.effective_user.id}")
+    query = update.callback_query
+    await query.answer()
+    await query.edit_message_text("⚡️ **บันทึกมิเตอร์ไฟ/น้ำ (เอง)** ⚡️\n\n"
+                                  "ฟังก์ชันนี้จะให้คุณบันทึกค่ามิเตอร์ด้วยตนเอง ซึ่ง **ต้องมีการพัฒนาเพิ่มเติม** "
+                                  "เพื่อระบุห้อง, ชนิดมิเตอร์ (ไฟ/น้ำ), ค่ามิเตอร์ปัจจุบัน และบันทึกลงในชีตที่เหมาะสม\n\n"
+                                  "*(ตอนนี้ยังไม่สามารถบันทึกได้จริง)*")
+    
+    keyboard = [[InlineKeyboardButton("🔙 กลับสู่เมนูจัดการค่าเช่า", callback_data='rent_menu_back')]]
+    await query.edit_message_reply_markup(reply_markup=InlineKeyboardMarkup(keyboard))
+    return RENT_MENU
+
+# --- Main Function ---
+def main() -> None:
+    """ฟังก์ชันหลักสำหรับรันบอท"""
+    if OWNER_CHAT_ID is None:
+        logger.critical("❌ OWNER_CHAT_ID ยังไม่ได้ถูกตั้งค่า! กรุณาใส่ Chat ID ของคุณในโค้ด")
+        return
+    if not TELEGRAM_BOT_TOKEN or not TELEGRAM_BOT_TOKEN.strip():
+        logger.critical("❌ ไม่พบ TELEGRAM_BOT_TOKEN กรุณาแก้ไขค่า TELEGRAM_BOT_TOKEN ในโค้ด")
+        return
+    if not isinstance(TELEGRAM_BOT_TOKEN, str) or len(TELEGRAM_BOT_TOKEN) < 30:
+        logger.critical("❌ TELEGRAM_BOT_TOKEN ไม่ถูกต้อง กรุณาตรวจสอบอีกครั้ง")
+        return
+
+    if not setup_gspread():
+        logger.critical("การตั้งค่า Google Sheet ล้มเหลว โปรดแก้ไขก่อนรันบอท Telegram. บอทจะไม่เริ่มทำงาน.")
+        return
+
+    application = Application.builder().token(TELEGRAM_BOT_TOKEN).build()
+    
+    application.add_handler(CommandHandler("start", start))
+    application.add_handler(CommandHandler("admin", admin))
+    application.add_handler(CommandHandler("help", start))
+
+    conv_handler = ConversationHandler(
+        entry_points=[CommandHandler("start", start), CommandHandler("admin", admin)],
+        states={
+            MENU: [
+                # เพิ่ม entry_points ของ Conversation Handler ลูกๆ ทั้งหมด
+                # เพื่อให้ ConvHandler หลักสามารถ 'เข้าสู่' Conversation ลูกได้จาก MENU
+                # CallbackQueryHandler (สำหรับปุ่ม)
+                CallbackQueryHandler(handle_menu_choice, pattern='^check_status$'),
+                CallbackQueryHandler(handle_menu_choice, pattern='^check_in_start$'),
+                CallbackQueryHandler(handle_menu_choice, pattern='^check_out_start$'),
+                CallbackQueryHandler(handle_menu_choice, pattern='^pre_booking_start$'), # ปุ่มจัดการจองล่วงหน้า
+                CallbackQueryHandler(handle_menu_choice, pattern='^monthly_system_start$'),
+                CallbackQueryHandler(handle_menu_choice, pattern='^view_reports$'),
+                CallbackQueryHandler(handle_menu_choice, pattern='^logout$'),
+                CallbackQueryHandler(handle_menu_choice, pattern='^back_to_menu$'),
+                # CommandHandler ที่อยู่ใน MENU state (ถ้ามี)
+                CommandHandler("start", start),
+                CommandHandler("admin", admin),
+                CommandHandler("help", start),
+
+                # --- Conversation Handler ลูกๆ (รวมไว้ใน states[MENU] เลย) ---
+                ConversationHandler(
+                    entry_points=[CallbackQueryHandler(handle_menu_choice, pattern='^check_in_start$')],
+                    states={
+                        CHECK_IN_ROOM: [MessageHandler(filters.TEXT & ~filters.COMMAND, get_check_in_room)],
+                        CHECK_IN_NAME: [MessageHandler(filters.TEXT & ~filters.COMMAND, get_check_in_name)],
+                        CHECK_IN_PHONE: [MessageHandler(filters.TEXT & ~filters.COMMAND, final_check_in_action)],
+                    },
+                    fallbacks=[CallbackQueryHandler(handle_menu_choice, pattern='^back_to_menu$'), CommandHandler("start", start)],
+                    map_to_parent={
+                        MENU: MENU
+                    }
+                ),
+                ConversationHandler(
+                    entry_points=[CallbackQueryHandler(handle_menu_choice, pattern='^check_out_start$')],
+                    states={
+                        CHECK_OUT_ROOM: [MessageHandler(filters.TEXT & ~filters.COMMAND, get_check_out_room)],
+                    },
+                    fallbacks=[CallbackQueryHandler(handle_menu_choice, pattern='^back_to_menu$'), CommandHandler("start", start)],
+                    map_to_parent={
+                        MENU: MENU
+                    }
+                ),
+                ConversationHandler(
+                    entry_points=[CallbackQueryHandler(handle_menu_choice, pattern='^pre_booking_start$')],
+                    states={
+                        PRE_BOOKING_ROOM: [MessageHandler(filters.TEXT & ~filters.COMMAND, get_pre_booking_room)],
+                        PRE_BOOKING_DATE: [MessageHandler(filters.TEXT & ~filters.COMMAND, get_pre_booking_date)],
+                        PRE_BOOKING_NIGHTS: [MessageHandler(filters.TEXT & ~filters.COMMAND, get_pre_booking_nights)],
+                        PRE_BOOKING_CONFIRM: [MessageHandler(filters.TEXT & ~filters.COMMAND, get_pre_booking_name)],
+                        PRE_BOOKING_PHONE: [MessageHandler(filters.TEXT & ~filters.COMMAND, final_pre_booking_action)],
+                        PRE_BOOKING_PAYMENT_CONFIRM: [
+                            MessageHandler(filters.PHOTO, handle_deposit_photo),
+                            CallbackQueryHandler(save_pre_booking_action, pattern='^save_pre_booking$'),
+                            CallbackQueryHandler(confirm_deposit_manual_action, pattern='^deposit_confirmed_manual:.*'),
+                            MessageHandler(filters.ALL & ~filters.COMMAND, unhandled_message_fallback),
+                        ]
+                    },
+                    fallbacks=[CallbackQueryHandler(handle_menu_choice, pattern='^cancel_pre_booking$|^pre_booking_back$'), CommandHandler("start", start)],
+                    map_to_parent={
+                        MENU: MENU
+                    }
+                ),
+                ConversationHandler(
+                    entry_points=[CallbackQueryHandler(handle_menu_choice, pattern='^add_employee_start$')],
+                    states={
+                        ADD_EMPLOYEE_NAME: [MessageHandler(filters.TEXT & ~filters.COMMAND, get_employee_name)],
+                        ADD_EMPLOYEE_POSITION: [MessageHandler(filters.TEXT & ~filters.COMMAND, get_employee_position)],
+                        ADD_EMPLOYEE_SALARY: [MessageHandler(filters.TEXT & ~filters.COMMAND, get_employee_salary)],
+                        ADD_EMPLOYEE_DAILY_SALARY: [MessageHandler(filters.TEXT & ~filters.COMMAND, get_employee_daily_salary)],
+                        ADD_EMPLOYEE_BANK: [MessageHandler(filters.TEXT & ~filters.COMMAND, get_employee_bank)],
+                        VIEW_EMPLOYEE: [MessageHandler(filters.TEXT & ~filters.COMMAND, confirm_add_employee)],
+                    },
+                    fallbacks=[CallbackQueryHandler(handle_menu_choice, pattern='^cancel_add_employee$|^employee_menu_back$'), CommandHandler("start", start)],
+                    map_to_parent={
+                        MENU: MENU # <--- แก้ไขตรงนี้ให้กลับไปที่ MENU หลัก
+                    }
+                ),
+                ConversationHandler(
+                    entry_points=[CallbackQueryHandler(handle_menu_choice, pattern='^issue_invoice_start$')],
+                    states={
+                        ISSUE_INVOICE_ROOM: [MessageHandler(filters.TEXT & ~filters.COMMAND, get_invoice_room)],
+                        ISSUE_INVOICE_DETAILS: [MessageHandler(filters.TEXT & ~filters.COMMAND, get_invoice_details_and_confirm)],
+                    },
+                    fallbacks=[CallbackQueryHandler(handle_menu_choice, pattern='^rent_menu_back$'), CommandHandler("start", start)],
+                    map_to_parent={
+                        MENU: MENU # <--- แก้ไขตรงนี้ให้กลับไปที่ MENU หลัก
+                    }
+                ),
+                # --- สิ้นสุด Conversation Handler ลูกๆ ---
+            ],
+            # สถานะอื่นๆ ที่เป็นส่วนหนึ่งของ ConvHandler หลัก (นอกเหนือจาก MENU)
+            MONTHLY_MENU: [CallbackQueryHandler(handle_menu_choice)], # Catch-all สำหรับปุ่มใน Monthly Menu
+            EMPLOYEE_MENU: [CallbackQueryHandler(handle_menu_choice)], # Catch-all สำหรับปุ่มใน Employee Menu
+            RENT_MENU: [CallbackQueryHandler(handle_menu_choice)], # Catch-all สำหรับปุ่มใน Rent Menu
+            # เพิ่ม MessageHandler ในแต่ละ State เพื่อการ Debug (หาก CallbackQueryHandler ไม่ทำงาน)
+            PRE_BOOKING_CONFIRM: [CallbackQueryHandler(handle_menu_choice)], # สำหรับ CallbackQuery ที่ไม่ได้ถูกจับ
+            PRE_BOOKING_PHONE: [CallbackQueryHandler(handle_menu_choice)], # สำหรับ CallbackQuery ที่ไม่ได้ถูกจับ
+            PRE_BOOKING_PAYMENT_CONFIRM: [CallbackQueryHandler(handle_menu_choice)], # สำหรับ CallbackQuery ที่ไม่ได้ถูกจับ
+        },
+        fallbacks=[CommandHandler("start", start), CallbackQueryHandler(handle_menu_choice, pattern='^logout$')],
+    )
+
+    application.add_handler(conv_handler)
+    
+    application.add_handler(MessageHandler(filters.ALL, unhandled_message_fallback))
+
+    logger.info("บอทเริ่มต้นทำงาน...")
+    application.run_polling(allowed_updates=Update.ALL_TYPES)
+    
+if __name__ == '__main__':
+    main()
